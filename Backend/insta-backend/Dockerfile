@@ -1,9 +1,25 @@
-FROM eclipse-temurin:17-jdk AS build
-WORKDIR /app
-COPY . .
-RUN chmod +x mvnw && ./mvnw clean package -DskipTests
+FROM maven:3.9-eclipse-temurin-21 AS build
 
-FROM eclipse-temurin:17-jre
 WORKDIR /app
+
+COPY pom.xml .
+COPY src ./src
+
+RUN mvn -B clean package -DskipTests
+
+FROM eclipse-temurin:21-jre-jammy
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg python3 curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+       -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
+
 COPY --from=build /app/target/*.jar app.jar
-CMD ["sh", "-c", "java -Xmx400m -jar app.jar --server.port=${PORT:-8080}"]
+
+EXPOSE 8080
+
+ENTRYPOINT ["sh", "-c", "java -Dserver.port=${PORT:-8080} -jar /app/app.jar"]
