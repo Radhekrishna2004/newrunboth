@@ -5,17 +5,21 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.regex.Pattern;
@@ -29,6 +33,8 @@ import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import jakarta.annotation.PostConstruct;
 
 @Service
 public class YtDlpService {
@@ -49,11 +55,6 @@ public class YtDlpService {
   private record Cached(MediaInfo info, long expires) {
   }
 
-  /*
-   * Sirf in links ki ijazat hai. Ye allow-list command injection / SSRF se
-   * bachati hai
-   * (URL kisi bhi aur site ka ya ajeeb characters wala nahi ho sakta).
-   */
   private static final Pattern ALLOWED_URL = Pattern.compile(
       "^https://(?:www\\.|m\\.)?(?:"
           + "instagram\\.com/(?:reel|reels|p|tv)/[A-Za-z0-9_-]+/?"
@@ -64,36 +65,74 @@ public class YtDlpService {
           + ")(?:[?&#][A-Za-z0-9_=&%.~-]*)?$",
       Pattern.CASE_INSENSITIVE);
 
+  private static final Pattern INSTAGRAM_URL = Pattern.compile(
+      "^https://(?:www\\.|m\\.)?instagram\\.com/", Pattern.CASE_INSENSITIVE);
+
   @Value("${ytdlp.path:yt-dlp}")
   private String ytDlpPath;
 
+  // Original cookies file (Render me /etc/secrets/cookies.txt, read-only)
   @Value("${ytdlp.cookies:}")
   private String cookies;
 
-  // Optional: ffmpeg ka folder/path, agar PATH me nahi milta (video+audio jodne
-  // ke liye zaroori)
+  // Optional: ffmpeg ka folder/path, agar PATH me nahi milta
   @Value("${ytdlp.ffmpeg-location:}")
   private String ffmpegLocation;
 
   @Value("${ytdlp.max-filesize:500M}")
   private String maxFilesize;
 
+  // Optional: residential proxy, jaise http://user:pass@host:port
+  @Value("${ytdlp.proxy:}")
+  private String proxy;
+
+  // Cookies ki writable copy (yt-dlp cookies wapas likhta hai)
+  private volatile String writableCookies = "";
+
   private final Semaphore slots;
-  // Same link dobara aaye (ya quality badle) to yt-dlp dobara nahi chalega: 10
-  // minute cache
   private final Map<String, Cached> infoCache = new ConcurrentHashMap<>();
-  // Same link ke liye ek hi yt-dlp chalta hai (auto-check + button click dono
-  // aaye to bhi)
   private final Map<String, CompletableFuture<MediaInfo>> inflight = new ConcurrentHashMap<>();
-  private final ExecutorService infoPool = Executors.newCachedThreadPool(r -> {
-    Thread t = new Thread(r, "info-worker");
+
+  private final ExecutorService infoPool;
+
+  private final ExecutorService ioPool = Executors.newCachedThreadPool(r -> {
+    Thread t = new Thread(r, "io-reader");
     t.setDaemon(true);
     return t;
   });
+
   private final ObjectMapper mapper = new ObjectMapper();
 
   public YtDlpService(@Value("${ytdlp.max-concurrent:3}") int maxConcurrent) {
-    this.slots = new Semaphore(Math.max(1, maxConcurrent));
+    int n = Math.max(1, maxConcurrent);
+    this.slots = new Semaphore(n);
+    this.infoPool = new ThreadPoolExecutor(
+        n * 2, n * 2, 30, TimeUnit.SECONDS,
+        new ArrayBlockingQueue<>(20),
+        r -> {
+          Thread t = new Thread(r, "info-worker");
+          t.setDaemon(true);
+          return t;
+        },
+        new ThreadPoolExecutor.AbortPolicy());
+    ((ThreadPoolExecutor) this.infoPool).allowCoreThreadTimeOut(true);
+  }
+
+  /** Startup par cookies ki writable copy banata hai. */
+  @PostConstruct
+  void prepareCookies() {
+    if (cookies == null || cookies.isBlank()) {
+      log.warn("Cookies set nahi hain. YouTube server IP ko block kar sakta hai.");
+      return;
+    }
+    try {
+      Path copy = Files.createTempFile("cookies-", ".txt");
+      Files.copy(Path.of(cookies), copy, StandardCopyOption.REPLACE_EXISTING);
+      writableCookies = copy.toString();
+      log.info("Cookies file load ho gayi.");
+    } catch (IOException | RuntimeException e) {
+      log.error("Cookies file copy nahi hui ({}): {}", cookies, e.getMessage());
+    }
   }
 
   public boolean isAllowed(String url) {
@@ -101,28 +140,37 @@ public class YtDlpService {
   }
 
   public String platform(String url) {
-    return url.toLowerCase().contains("instagram.com") ? "instagram" : "youtube";
+    return INSTAGRAM_URL.matcher(url.trim()).find() ? "instagram" : "youtube";
   }
 
   // ---------------- INFO ----------------
-  public MediaInfo fetchInfo(String url) {
+  public MediaInfo fetchInfo(String rawUrl) {
+    final String url = rawUrl.trim();
+
     Cached c = infoCache.get(url);
     if (c != null && c.expires() > System.currentTimeMillis()) {
       return c.info();
     }
 
-    // Is link ka yt-dlp pehle se chal raha ho to naya nahi chalta, uska wait karta
-    // hai
-    CompletableFuture<MediaInfo> f = inflight.computeIfAbsent(url,
-        k -> CompletableFuture.supplyAsync(() -> loadInfo(k), infoPool));
+    CompletableFuture<MediaInfo> f;
+    try {
+      f = inflight.computeIfAbsent(url,
+          k -> CompletableFuture.supplyAsync(() -> loadInfo(k), infoPool));
+    } catch (RejectedExecutionException e) {
+      throw new ApiException(HttpStatus.SERVICE_UNAVAILABLE, "Server is busy. Please try again in a minute.");
+    }
 
     try {
       MediaInfo fresh = f.get(60, TimeUnit.SECONDS);
 
+      long now = System.currentTimeMillis();
       if (infoCache.size() > 500) {
-        infoCache.clear();
+        infoCache.values().removeIf(x -> x.expires() <= now);
+        if (infoCache.size() > 500) {
+          infoCache.clear();
+        }
       }
-      infoCache.put(url, new Cached(fresh, System.currentTimeMillis() + 10 * 60_000L));
+      infoCache.put(url, new Cached(fresh, now + 10 * 60_000L));
       return fresh;
 
     } catch (ExecutionException e) {
@@ -141,14 +189,8 @@ public class YtDlpService {
   }
 
   private MediaInfo loadInfo(String url) {
-    List<String> cmd = baseArgs();
+    List<String> cmd = baseArgs(url);
     cmd.add("-J");
-    if ("youtube".equals(platform(url))) {
-      // Tez: HLS manifest aur auto-translated subtitles ka kaam skip (inki zaroorat
-      // nahi)
-      cmd.add("--extractor-args");
-      cmd.add("youtube:skip=hls,translated_subs");
-    }
     cmd.add(url);
 
     ProcResult r = run(cmd, 40);
@@ -156,7 +198,7 @@ public class YtDlpService {
 
     if (r.exit() != 0 || !out.startsWith("{")) {
       log.warn("yt-dlp info failed: {}", r.err());
-      throw new ApiException(HttpStatus.BAD_GATEWAY, friendlyError(r.err()));
+      throw new ApiException(HttpStatus.BAD_GATEWAY, friendlyError(r.err(), platform(url)));
     }
 
     try {
@@ -176,17 +218,10 @@ public class YtDlpService {
     }
   }
 
-  /*
-   * "Quality" = video ki chhoti side. 1080x1920 (vertical reel) bhi 1080p hai,
-   * 1920x1080 (landscape) bhi 1080p. Isse vertical reels galti se "locked" nahi
-   * hongi.
-   */
   private static List<QualityInfo> qualities(JsonNode item) {
     double duration = item.path("duration").asDouble(0);
     long audio = audioSize(item);
 
-    // Har quality ke liye ek format chuno (H.264 ko prefer, jaise download me hota
-    // hai)
     Map<Integer, JsonNode> best = new TreeMap<>();
     for (JsonNode f : item.path("formats")) {
       if ("none".equals(f.path("vcodec").asText("none"))) {
@@ -210,7 +245,7 @@ public class YtDlpService {
       long size = formatSize(f, duration);
       boolean hasAudio = !"none".equals(f.path("acodec").asText("none"));
       if (size > 0 && !hasAudio) {
-        size += audio; // sirf-video format hai, to audio ka size bhi jodo
+        size += audio;
       }
       out.add(new QualityInfo(e.getKey(), size));
     }
@@ -226,25 +261,20 @@ public class YtDlpService {
     return a.path("tbr").asDouble(0) > b.path("tbr").asDouble(0);
   }
 
-  /**
-   * Format ka size (bytes): pehle exact, phir approx, phir bitrate x duration se
-   * andaza.
-   */
   private static long formatSize(JsonNode f, double duration) {
     long size = f.path("filesize").asLong(0);
     if (size <= 0) {
       size = f.path("filesize_approx").asLong(0);
     }
     if (size <= 0) {
-      double tbr = f.path("tbr").asDouble(0); // kbit/s
+      double tbr = f.path("tbr").asDouble(0);
       if (tbr > 0 && duration > 0) {
-        size = (long) (tbr * duration * 125); // kbit/s -> bytes
+        size = (long) (tbr * duration * 125);
       }
     }
     return Math.max(size, 0);
   }
 
-  /** Sabse achhe audio-only format (m4a ko prefer) ka size. */
   private static long audioSize(JsonNode item) {
     double duration = item.path("duration").asDouble(0);
     long best = 0;
@@ -267,11 +297,8 @@ public class YtDlpService {
   }
 
   // ---------------- DOWNLOAD ----------------
-  /**
-   * Media temp folder me download karke file ka path deta hai. Baad me cleanup()
-   * zaroor chalao.
-   */
-  public Path download(String url, int maxQuality) {
+  public Path download(String rawUrl, int maxQuality) {
+    final String url = rawUrl.trim();
 
     boolean got;
     try {
@@ -288,26 +315,19 @@ public class YtDlpService {
     try {
       dir = Files.createTempDirectory("dl-");
 
-      // Quality cap hard hai: chhoti side <= maxQuality. Cap se upar wala format
-      // kabhi nahi chunega.
-      String q = String.valueOf(maxQuality);
-      String selector = "bv*[height<=?" + q + "]+ba/bv*[width<=?" + q + "]+ba"
-          + "/b[height<=?" + q + "]/b[width<=?" + q + "]";
+      String selector = "bv*+ba/b";
+      String sort = "res:" + maxQuality + ",vcodec:h264,acodec:aac";
 
-      List<String> cmd = baseArgs();
+      List<String> cmd = baseArgs(url);
       cmd.add("--playlist-items");
       cmd.add("1");
       cmd.add("--max-filesize");
       cmd.add(maxFilesize);
-      cmd.add("-N"); // 4 parts ek saath download (YouTube ke liye tez)
+      cmd.add("-N");
       cmd.add("4");
       cmd.add("--no-mtime");
-      // Same quality me H.264 video + AAC audio ko prefer karo (har player me chalta
-      // hai).
-      // Default me YouTube AV1 + Opus deta hai jo Windows Media Player nahi chala
-      // pata.
       cmd.add("-S");
-      cmd.add("res,vcodec:h264,acodec:aac");
+      cmd.add(sort);
       cmd.add("-f");
       cmd.add(selector);
       cmd.add("--merge-output-format");
@@ -320,8 +340,7 @@ public class YtDlpService {
 
       if (r.exit() != 0) {
         log.warn("yt-dlp download failed: {}", r.err());
-        deleteDir(dir);
-        throw new ApiException(HttpStatus.BAD_GATEWAY, friendlyError(r.err()));
+        throw new ApiException(HttpStatus.BAD_GATEWAY, friendlyError(r.err(), platform(url)));
       }
 
       if (!r.err().isBlank()) {
@@ -330,17 +349,11 @@ public class YtDlpService {
 
       String errLower = r.err().toLowerCase();
       if (errLower.contains("ffmpeg is not installed") || errLower.contains("ffmpeg not found")) {
-        log.error("ffmpeg nahi mila, video aur audio jud nahi sakte. PATH theek karo ya "
-            + "application.properties me ytdlp.ffmpeg-location set karo.");
-        deleteDir(dir);
+        log.error("ffmpeg nahi mila, video aur audio jud nahi sakte.");
         throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR,
             "Server setup problem: ffmpeg is missing, so video and audio could not be merged.");
       }
 
-      // Final (merge hui) file ka naam sirf "media.mp4" jaisa hota hai.
-      // "media.f251.webm" jaise
-      // naam adhoore tukde hain (sirf audio ya sirf video), wo user ko kabhi nahi
-      // dene.
       try (Stream<Path> files = Files.list(dir)) {
         List<Path> all = files.toList();
         Path found = all.stream()
@@ -348,9 +361,8 @@ public class YtDlpService {
             .findFirst()
             .orElse(null);
         if (found == null) {
-          log.error("Merged file nahi bani. Temp folder me files: {}. ffmpeg PATH me hai? File bahut badi to nahi?",
+          log.error("Merged file nahi bani. Temp folder me files: {}",
               all.stream().map(x -> x.getFileName().toString()).toList());
-          deleteDir(dir);
           throw new ApiException(HttpStatus.BAD_GATEWAY,
               "Could not prepare this quality (file too large, or video and audio could not be merged). Try a lower quality.");
         }
@@ -359,13 +371,20 @@ public class YtDlpService {
     } catch (IOException e) {
       deleteDir(dir);
       throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, "Server storage error.");
+    } catch (RuntimeException e) {
+      deleteDir(dir);
+      throw e;
     } finally {
       slots.release();
     }
   }
 
-  /** Sirf audio download (mp3 ya m4a). Baad me cleanup() zaroor chalao. */
-  public Path downloadAudio(String url, String fmt) {
+  public Path downloadAudio(String rawUrl, String fmt) {
+    final String url = rawUrl.trim();
+
+    if (!"mp3".equals(fmt) && !"m4a".equals(fmt)) {
+      throw new ApiException(HttpStatus.BAD_REQUEST, "Unsupported audio format.");
+    }
 
     boolean got;
     try {
@@ -382,7 +401,7 @@ public class YtDlpService {
     try {
       dir = Files.createTempDirectory("dl-");
 
-      List<String> cmd = baseArgs();
+      List<String> cmd = baseArgs(url);
       cmd.add("--playlist-items");
       cmd.add("1");
       cmd.add("--max-filesize");
@@ -391,8 +410,6 @@ public class YtDlpService {
       cmd.add("4");
       cmd.add("--no-mtime");
       cmd.add("-f");
-      // m4a me original AAC mil jaata hai (re-encode nahi hota, tez); mp3 ke liye
-      // ffmpeg convert karta hai
       cmd.add("m4a".equals(fmt) ? "bestaudio[ext=m4a]/bestaudio/best" : "bestaudio/best");
       cmd.add("-x");
       cmd.add("--audio-format");
@@ -407,17 +424,15 @@ public class YtDlpService {
 
       if (r.exit() != 0) {
         log.warn("yt-dlp audio failed: {}", r.err());
-        deleteDir(dir);
-        throw new ApiException(HttpStatus.BAD_GATEWAY, friendlyError(r.err()));
+        throw new ApiException(HttpStatus.BAD_GATEWAY, friendlyError(r.err(), platform(url)));
       }
 
       try (Stream<Path> files = Files.list(dir)) {
         Path found = files
-            .filter(p -> !p.getFileName().toString().endsWith(".part"))
+            .filter(p -> p.getFileName().toString().matches("(?i)media\\.(mp3|m4a)"))
             .findFirst()
             .orElse(null);
         if (found == null) {
-          deleteDir(dir);
           throw new ApiException(HttpStatus.BAD_GATEWAY, "Audio download failed. Please try again.");
         }
         return found;
@@ -425,6 +440,9 @@ public class YtDlpService {
     } catch (IOException e) {
       deleteDir(dir);
       throw new ApiException(HttpStatus.INTERNAL_SERVER_ERROR, "Server storage error.");
+    } catch (RuntimeException e) {
+      deleteDir(dir);
+      throw e;
     } finally {
       slots.release();
     }
@@ -437,20 +455,34 @@ public class YtDlpService {
   }
 
   // ---------------- helpers ----------------
-  private List<String> baseArgs() {
+  /**
+   * Har yt-dlp command ke common args. YouTube ke liye extra settings yahin lagti
+   * hain.
+   */
+  private List<String> baseArgs(String url) {
     List<String> cmd = new ArrayList<>();
     cmd.add(ytDlpPath);
     cmd.add("--no-warnings");
+    cmd.add("--no-progress");
     cmd.add("--no-playlist");
     cmd.add("--socket-timeout");
     cmd.add("15");
-    if (cookies != null && !cookies.isBlank()) {
+    if (!writableCookies.isBlank()) {
       cmd.add("--cookies");
-      cmd.add(cookies);
+      cmd.add(writableCookies);
     }
     if (ffmpegLocation != null && !ffmpegLocation.isBlank()) {
       cmd.add("--ffmpeg-location");
       cmd.add(ffmpegLocation);
+    }
+    if (proxy != null && !proxy.isBlank()) {
+      cmd.add("--proxy");
+      cmd.add(proxy);
+    }
+    if ("youtube".equals(platform(url))) {
+      // info aur download dono me same client, taaki dono jagah kaam kare
+      cmd.add("--extractor-args");
+      cmd.add("youtube:player_client=default,mweb;skip=translated_subs");
     }
     return cmd;
   }
@@ -466,10 +498,15 @@ public class YtDlpService {
   }
 
   private ProcResult run(List<String> cmd, int timeoutSec) {
-    final Process p = startProcess(cmd); // shell nahi, args list -> injection nahi
+    final Process p = startProcess(cmd);
 
-    CompletableFuture<String> out = CompletableFuture.supplyAsync(() -> readAll(p.getInputStream()));
-    CompletableFuture<String> err = CompletableFuture.supplyAsync(() -> readAll(p.getErrorStream()));
+    try {
+      p.getOutputStream().close();
+    } catch (IOException ignored) {
+    }
+
+    CompletableFuture<String> out = CompletableFuture.supplyAsync(() -> readAll(p.getInputStream()), ioPool);
+    CompletableFuture<String> err = CompletableFuture.supplyAsync(() -> readAll(p.getErrorStream()), ioPool);
 
     try {
       if (!p.waitFor(timeoutSec, TimeUnit.SECONDS)) {
@@ -515,29 +552,45 @@ public class YtDlpService {
     }
   }
 
-  private static String friendlyError(String stderr) {
+  private static String friendlyError(String stderr, String platform) {
     String s = stderr == null ? "" : stderr.toLowerCase();
-    if (s.contains("ffmpeg") && (s.contains("not found") || s.contains("not installed"))) {
+
+    if (s.contains("ffmpeg")
+        && (s.contains("not found") || s.contains("not installed"))) {
       return "Server setup problem: ffmpeg is missing.";
     }
-    if (s.contains("login required") || s.contains("rate-limit") || s.contains("cookies")) {
-      return "Instagram is asking for login for this link (private post, or this server was blocked). Try another public link.";
+
+    if (s.contains("confirm your age")) {
+      return "This video is age-restricted and cannot be downloaded here.";
     }
+
+    // YouTube bot-check: cookies ka zikr bhi aata hai, isliye Instagram se pehle
     if (s.contains("sign in to confirm") || s.contains("not a bot")) {
-      return "YouTube blocked the request from this server. Please try again later.";
+      return "YouTube is blocking this server right now. Please try again later.";
     }
+
+    if (s.contains("login required") || s.contains("rate-limit")) {
+      return "youtube".equals(platform)
+          ? "YouTube is blocking this server right now. Please try again later."
+          : "Instagram is requesting login or has rate-limited this server. Try another public link.";
+    }
+
     if (s.contains("private")) {
       return "This content is private.";
     }
-    if (s.contains("unavailable") || s.contains("not found") || s.contains("404")) {
-      return "This content is unavailable or was removed.";
-    }
+
     if (s.contains("requested format is not available")) {
       return "This quality is not available for this video.";
     }
+
     if (s.contains("larger than max-filesize") || s.contains("max-filesize")) {
       return "This file is too large to download here.";
     }
+
+    if (s.contains("unavailable") || s.contains("not found") || s.contains("http error 404")) {
+      return "This content is unavailable or was removed.";
+    }
+
     return "Could not fetch this link. Please try again.";
   }
 }

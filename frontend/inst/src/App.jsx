@@ -11,6 +11,9 @@ const INSTA_RE =
 const YT_RE =
   /^https?:\/\/(www\.|m\.)?(youtube\.com\/(watch|shorts)|youtu\.be\/).+/i;
 
+// Backend sirf https links leta hai, isliye http ko https bana do aur spaces hata do
+const fixUrl = (v) => (v || "").trim().replace(/^http:\/\//i, "https://");
+
 const css = `
 @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');
 *{box-sizing:border-box}body{margin:0}.fi{font-family:Poppins,system-ui,sans-serif;color:#1a1a2e;min-height:100vh;padding:14px;background:radial-gradient(circle at 0% 20%,#c24bff 0,transparent 35%),radial-gradient(circle at 100% 10%,#ff5fa8 0,transparent 35%),linear-gradient(180deg,#e9d5ff,#fdf2f8)}
@@ -121,12 +124,13 @@ function useAdblock() {
     setBlocked(found);
   }, []);
   useEffect(() => {
-    if (import.meta.env.DEV) return;
+    // FIX: jab tak AdSense set nahi hai (ads hain hi nahi), adblock check mat chalao
+    if (import.meta.env.DEV || !ADSENSE_CLIENT) return;
     check();
     window.addEventListener("focus", check);
     return () => window.removeEventListener("focus", check);
   }, [check]);
-  return !import.meta.env.DEV && blocked;
+  return !import.meta.env.DEV && !!ADSENSE_CLIENT && blocked;
 }
 
 function AdblockWall() {
@@ -305,7 +309,8 @@ function useDownloader({ validate, invalidText, auto = true }) {
       reset();
       setMsg({ text: "", ok: true });
       if (timerRef.current) clearTimeout(timerRef.current);
-      const url = v.trim();
+      // FIX: http -> https aur trim
+      const url = fixUrl(v);
       if (auto && validate(url)) {
         timerRef.current = setTimeout(() => analyzeUrl(url), 250);
       }
@@ -322,7 +327,8 @@ function useDownloader({ validate, invalidText, auto = true }) {
   );
 
   const analyze = () => {
-    const url = link.trim();
+    // FIX: http -> https aur trim
+    const url = fixUrl(link);
     if (!validate(url)) {
       reset();
       setMsg({ text: invalidText, ok: false });
@@ -333,7 +339,7 @@ function useDownloader({ validate, invalidText, auto = true }) {
   };
 
   const paste = (e) => {
-    const t = (e.clipboardData?.getData("text") || "").trim();
+    const t = fixUrl(e.clipboardData?.getData("text") || "");
     if (validate(t)) {
       e.preventDefault();
       change(t);
@@ -351,7 +357,8 @@ function useDownloader({ validate, invalidText, auto = true }) {
       ok: true,
     });
     try {
-      const params = new URLSearchParams({ url: link.trim(), quality });
+      // FIX: download me bhi https wala link jaaye
+      const params = new URLSearchParams({ url: fixUrl(link), quality });
       if (audio) params.set("audio", audio);
       const res = await fetch(`${API}/api/media/download?${params}`);
       if (!res.ok) {
