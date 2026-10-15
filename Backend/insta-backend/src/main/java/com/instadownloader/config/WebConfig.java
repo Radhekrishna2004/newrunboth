@@ -9,7 +9,11 @@ import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 @Configuration
 public class WebConfig implements WebMvcConfigurer {
 
-  @Value("${app.cors.origins:http://localhost:5173}")
+  // Default me localhost (local testing) aur Render wali frontend site dono
+  // allowed hain.
+  // Agar Render me app.cors.origins / APP_CORS_ORIGINS set hoga to wahi value use
+  // hogi.
+  @Value("${app.cors.origins:http://localhost:5173,https://fastest-insta-rk.onrender.com}")
   private String origins;
 
   private final RateLimitInterceptor rateLimit;
@@ -21,7 +25,7 @@ public class WebConfig implements WebMvcConfigurer {
   @Override
   public void addCorsMappings(CorsRegistry registry) {
     registry.addMapping("/api/**")
-        .allowedOrigins(origins.split("\\s*,\\s*"))
+        .allowedOrigins(origins.trim().split("\\s*,\\s*"))
         .allowedMethods("GET", "POST", "OPTIONS")
         .allowedHeaders("*")
         .exposedHeaders("Content-Disposition")
